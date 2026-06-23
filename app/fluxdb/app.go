@@ -60,6 +60,7 @@ type Config struct {
 	IgnoreIndexRangeStart      uint64 // When indexing a tablet, ignore an existing an index if it's between this range start boundary, both start/stop must be defined to be taken into account
 	IgnoreIndexRangeStop       uint64 // When indexing a tablet, ignore an existing an index if it's between this range stop boundary, both start/stop must be defined to be taken into account
 	WriteOnEachBlock           bool   // Writes to storage engine at each irreversible block, can be used in development to flush more rapidly to storage
+	MaxReversibleBlocks        int    // Caps the reversible buffer; on a LIB stall the handler fails fast (clean restart) instead of OOMing. 0 disables.
 }
 
 type Modules struct {
@@ -128,7 +129,7 @@ func (a *App) startStandard(blocksStore dstore.Store, kvStore store.KVStore) err
 	}
 
 	zlog.Info("initiating fluxdb handler")
-	fluxDBHandler := fluxdb.NewHandler(db)
+	fluxDBHandler := fluxdb.NewHandler(db, fluxdb.WithMaxReversibleBlocks(a.config.MaxReversibleBlocks))
 
 	db.SpeculativeWritesFetcher = fluxDBHandler.FetchSpeculativeWrites
 	db.HeadBlock = fluxDBHandler.HeadBlock

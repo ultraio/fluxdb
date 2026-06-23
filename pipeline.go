@@ -175,14 +175,35 @@ type FluxDBHandler struct {
 	batchWritableRows int
 
 	lastBlockIDCheck time.Time
+
+	// maxReversibleBlocks, when > 0, caps serverForkDB's reversible buffer. Eviction
+	// is LIB-driven (MoveLIB) only, so a LIB stall grows it unbounded -> OOM. Exceeding
+	// the cap makes ProcessBlock fail fast for a clean restart. See WithMaxReversibleBlocks.
+	maxReversibleBlocks int
 }
 
-func NewHandler(db *FluxDB) *FluxDBHandler {
-	return &FluxDBHandler{
+// HandlerOption configures a FluxDBHandler.
+type HandlerOption func(*FluxDBHandler)
+
+// WithMaxReversibleBlocks bounds serverForkDB's reversible buffer so a LIB stall fails
+// fast (clean restart) instead of OOMing. 0 (the default) disables the cap. Set it far
+// above the normal head-minus-LIB window; it should only fire on a genuine LIB stall.
+func WithMaxReversibleBlocks(max int) HandlerOption {
+	return func(p *FluxDBHandler) {
+		p.maxReversibleBlocks = max
+	}
+}
+
+func NewHandler(db *FluxDB, opts ...HandlerOption) *FluxDBHandler {
+	p := &FluxDBHandler{
 		db:        db,
 		ctx:       context.Background(),
 		headBlock: bstream.BlockRefEmpty,
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 func (p *FluxDBHandler) EnableWrites() {
@@ -277,6 +298,24 @@ func (p *FluxDBHandler) ProcessBlock(rawBlk *bstream.Block, rawObj interface{}) 
 
 		previousRef := rawBlk.PreviousRef()
 		p.serverForkDB.AddLink(blkRef, rawBlk.PreviousRef(), fObj.Obj.(*WriteRequest))
+
+		// Bound the reversible buffer. AddLink just grew it; eviction (MoveLIB) only
+		// happens on StepIrreversible, so a LIB stall grows it without bound -> OOM.
+		// Fail fast here so statedb-inject restarts cleanly from its cursor instead.
+		if p.maxReversibleBlocks > 0 {
+			n := p.serverForkDB.ReversibleBlockCount()
+			if n > p.maxReversibleBlocks {
+				return fmt.Errorf("fluxdb reversible buffer exceeded cap of %d blocks (have %d): LIB likely stalled at %d while head is at %d; failing fast for a clean restart", p.maxReversibleBlocks, n, p.serverForkDB.LIBNum(), rawBlk.Num())
+			}
+			if n > p.maxReversibleBlocks/2 && rawBlk.Num()%600 == 0 {
+				zlog.Warn("fluxdb reversible buffer is growing abnormally — LIB may be stalling (will fail fast at the cap to avoid OOM)",
+					zap.Int("reversible_blocks", n),
+					zap.Int("cap", p.maxReversibleBlocks),
+					zap.Uint64("lib_num", p.serverForkDB.LIBNum()),
+					zap.Uint64("head_num", rawBlk.Num()),
+				)
+			}
+		}
 
 		// When we starting, if fluxdb internal forkdb has no LIB and we are seeing the first block, let's use it as the LIB
 		if !p.serverForkDB.HasLIB() && rawBlk.Num() == bstream.GetProtocolFirstStreamableBlock {

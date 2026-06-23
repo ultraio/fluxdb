@@ -243,8 +243,12 @@ func (p *FluxDBHandler) updateSpeculativeWrites(newHeadBlock bstream.BlockRef) {
 		newWrites = append(newWrites, req)
 	}
 
-	p.speculativeReadsLock.RLock()
-	defer p.speculativeReadsLock.RUnlock()
+	// Use the write lock: this method mutates speculativeWrites/headBlock. Holding
+	// only RLock here (as the original did) gives no writer exclusion against the
+	// concurrent readers HeadBlock/FetchSpeculativeWrites (also RLock), producing a
+	// data race and torn head-vs-writes during reorgs.
+	p.speculativeReadsLock.Lock()
+	defer p.speculativeReadsLock.Unlock()
 
 	p.speculativeWrites = newWrites
 	p.headBlock = newHeadBlock
